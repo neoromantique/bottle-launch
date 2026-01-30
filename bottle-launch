@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Flatpak Encrypted Bottle Launcher
+# Launches Flatpak apps with data stored in LUKS-encrypted containers
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly LOCK_DIR="/tmp/bottle-locks"
+
+# Global state for cleanup
+MAPPER_NAME=""
+MOUNT_POINT=""
+LOCK_FILE=""
+LOOP_DEVICE=""
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME <command> [options]
+
+Commands:
+    create <bottle> <size>    Create a new encrypted bottle
+    run <bottle> <app_id> [-- extra_args...]
+                              Run Flatpak app with data in bottle
+    list                      List currently mounted bottles
+
+Examples:
+    $SCRIPT_NAME create myapp.bottle 2G
+    $SCRIPT_NAME run firefox.bottle org.mozilla.firefox
+    $SCRIPT_NAME run firefox.bottle org.mozilla.firefox -- --private-window
+EOF
+    exit 1
+}
+
+# Generate unique mapper name from absolute bottle path
+get_mapper_name() {
+    local bottle="$1"
+    local abs_path
+    abs_path="$(realpath -m "$bottle")"
+    echo "bottle-$(echo -n "$abs_path" | sha256sum | cut -c1-12)"
+}
+
+# Check if bottle is already mounted
+is_mounted() {
+    local mapper_name="$1"
+    [[ -e "/dev/mapper/$mapper_name" ]]
+}
+
+# Acquire lock for bottle
+acquire_lock() {
+    local mapper_name="$1"
+    mkdir -p "$LOCK_DIR"
+    LOCK_FILE="$LOCK_DIR/$mapper_name.lock"
+
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        die "Bottle is already in use by another process"
+    fi
+}
+
+# Release lock
+release_lock() {
+    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+        flock -u 9 2>/dev/null || true
+        rm -f "$LOCK_FILE" 2>/dev/null || true
+    fi
+}
+
+# Cleanup function - unmount and close LUKS
+cleanup() {
+    local exit_code=$?
+
+    if [[ -n "$MOUNT_POINT" && -d "$MOUNT_POINT" ]]; then
+        sudo umount "$MOUNT_POINT" 2>/dev/null || true
+        rmdir "$MOUNT_POINT" 2>/dev/null || true
+    fi
+
+    if [[ -n "$MAPPER_NAME" ]] && is_mounted "$MAPPER_NAME"; then
+        sudo cryptsetup close "$MAPPER_NAME" 2>/dev/null || true
+    fi
+
+    if [[ -n "$LOOP_DEVICE" && -e "$LOOP_DEVICE" ]]; then
+        sudo losetup -d "$LOOP_DEVICE" 2>/dev/null || true
+    fi
+
+    release_lock
+
+    exit $exit_code
+}
+
+# Prompt user to create a missing bottle
+prompt_create() {
+    local bottle="$1"
+
+    echo "Bottle '$bottle' does not exist."
+    read -rp "Would you like to create it? [y/N] " response
+
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        die "Cannot run without bottle"
+    fi
+
+    echo "Select size:"
+    echo "  1) 500M"
+    echo "  2) 1G"
+    echo "  3) 2G"
+    echo "  4) 5G"
+    echo "  5) 10G"
+    echo "  6) Custom"
+    read -rp "Choice [1-6]: " choice
+
+    local size
+    case "$choice" in
+        1) size="500M" ;;
+        2) size="1G" ;;
+        3) size="2G" ;;
+        4) size="5G" ;;
+        5) size="10G" ;;
+        6)
+            read -rp "Enter size (e.g., 500M, 2G): " size
+            [[ -z "$size" ]] && die "No size provided"
+            ;;
+        *) die "Invalid choice" ;;
+    esac
+
+    cmd_create "$bottle" "$size"
+}
+
+# Create a new LUKS-encrypted bottle
+cmd_create() {
+    local bottle="$1"
+    local size="$2"
+
+    [[ -z "$bottle" ]] && die "Bottle path required"
+    [[ -z "$size" ]] && die "Size required (e.g., 500M, 2G)"
+    [[ -e "$bottle" ]] && die "Bottle '$bottle' already exists"
+
+    # Convert to absolute path for sudo commands
+    bottle="$(realpath -m "$bottle")"
+
+    local mapper_name
+    mapper_name="$(get_mapper_name "$bottle")"
+
+    echo "Creating bottle: $bottle ($size)"
+
+    # Create sparse file
+    truncate -s "$size" "$bottle" || die "Failed to create file"
+
+    # Format as LUKS (will prompt for password)
+    echo "Setting up encryption (you will be prompted for a password)..."
+    if ! sudo cryptsetup luksFormat --type luks2 "$bottle"; then
+        rm -f "$bottle"
+        die "LUKS format failed"
+    fi
+
+    # Open, format filesystem, close
+    echo "Creating filesystem..."
+    local loop_dev
+    loop_dev="$(sudo losetup --find --show "$bottle")" || {
+        rm -f "$bottle"
+        die "Failed to create loop device"
+    }
+
+    if ! sudo cryptsetup open "$loop_dev" "$mapper_name"; then
+        sudo losetup -d "$loop_dev"
+        rm -f "$bottle"
+        die "Failed to open LUKS container"
+    fi
+
+    if ! sudo mkfs.ext4 -q "/dev/mapper/$mapper_name"; then
+        sudo cryptsetup close "$mapper_name"
+        sudo losetup -d "$loop_dev"
+        rm -f "$bottle"
+        die "Failed to create filesystem"
+    fi
+
+    sudo cryptsetup close "$mapper_name"
+    sudo losetup -d "$loop_dev"
+
+    echo "Bottle created successfully: $bottle"
+}
+
+# Run Flatpak app with data in bottle
+cmd_run() {
+    local bottle="$1"
+    shift
+    local app_id="$1"
+    shift
+
+    [[ -z "$bottle" ]] && die "Bottle path required"
+    [[ -z "$app_id" ]] && die "Flatpak app ID required"
+
+    # Check if bottle exists, prompt to create if not
+    if [[ ! -f "$bottle" ]]; then
+        prompt_create "$bottle"
+    fi
+
+    # Convert to absolute path for sudo commands
+    bottle="$(realpath "$bottle")"
+
+    MAPPER_NAME="$(get_mapper_name "$bottle")"
+    MOUNT_POINT="/tmp/$MAPPER_NAME"
+
+    # Acquire lock to prevent concurrent access
+    acquire_lock "$MAPPER_NAME"
+
+    # Set up cleanup trap
+    trap cleanup EXIT INT TERM
+
+    # Check if already mounted (reuse existing mount)
+    if is_mounted "$MAPPER_NAME"; then
+        echo "Bottle already mounted, reusing..."
+        if ! mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+            sudo mkdir -p "$MOUNT_POINT"
+            sudo mount "/dev/mapper/$MAPPER_NAME" "$MOUNT_POINT"
+        fi
+    else
+        # Create loop device for the bottle file
+        LOOP_DEVICE="$(sudo losetup --find --show "$bottle")" || die "Failed to create loop device"
+
+        # Open LUKS container (prompts for password)
+        echo "Opening encrypted bottle..."
+        if ! sudo cryptsetup open "$LOOP_DEVICE" "$MAPPER_NAME"; then
+            sudo losetup -d "$LOOP_DEVICE"
+            LOOP_DEVICE=""
+            die "Failed to open bottle"
+        fi
+
+        # Mount filesystem
+        sudo mkdir -p "$MOUNT_POINT"
+        if ! sudo mount "/dev/mapper/$MAPPER_NAME" "$MOUNT_POINT"; then
+            sudo cryptsetup close "$MAPPER_NAME"
+            sudo losetup -d "$LOOP_DEVICE"
+            LOOP_DEVICE=""
+            die "Failed to mount"
+        fi
+    fi
+
+    # Set ownership so Flatpak app can write
+    sudo chown "$(id -u):$(id -g)" "$MOUNT_POINT"
+
+    echo "Running $app_id..."
+
+    # Run Flatpak with HOME inside bottle
+    flatpak run \
+        --filesystem="$MOUNT_POINT" \
+        --env=HOME="$MOUNT_POINT" \
+        --env=XDG_DATA_HOME="$MOUNT_POINT/.local/share" \
+        --env=XDG_CONFIG_HOME="$MOUNT_POINT/.config" \
+        --env=XDG_CACHE_HOME="$MOUNT_POINT/.cache" \
+        "$app_id" "$@" || true
+
+    # Cleanup runs via trap
+    echo "Closing bottle..."
+}
+
+# List currently mounted bottles
+cmd_list() {
+    echo "Currently mounted bottles:"
+    echo
+
+    local found=0
+    for mapper in /dev/mapper/bottle-*; do
+        [[ -e "$mapper" ]] || continue
+        found=1
+
+        local name="${mapper##*/}"
+        local mount_point="/tmp/$name"
+
+        echo "  Mapper: $name"
+        if mountpoint -q "$mount_point" 2>/dev/null; then
+            echo "  Mount:  $mount_point"
+            df -h "$mount_point" 2>/dev/null | tail -1 | awk '{print "  Usage:  " $3 " / " $2 " (" $5 ")"}'
+        else
+            echo "  Mount:  (not mounted)"
+        fi
+        echo
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "  (none)"
+    fi
+}
+
+# Main entry point
+main() {
+    [[ $# -lt 1 ]] && usage
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        create)
+            [[ $# -lt 2 ]] && die "Usage: $SCRIPT_NAME create <bottle> <size>"
+            cmd_create "$1" "$2"
+            ;;
+        run)
+            [[ $# -lt 2 ]] && die "Usage: $SCRIPT_NAME run <bottle> <app_id> [-- args...]"
+            local bottle="$1"
+            shift
+            local app_id="$1"
+            shift
+
+            # Handle -- separator for extra args
+            local extra_args=()
+            if [[ $# -gt 0 && "$1" == "--" ]]; then
+                shift
+                extra_args=("$@")
+            fi
+
+            cmd_run "$bottle" "$app_id" "${extra_args[@]}"
+            ;;
+        list)
+            cmd_list
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            die "Unknown command: $cmd"
+            ;;
+    esac
+}
+
+main "$@"
