@@ -1,0 +1,18 @@
+# Binary
+bottle-launch
+bottle-launch-go
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+*.test
+coverage.out
+
+# OS files
+.DS_Store
+Thumbs.db

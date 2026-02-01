@@ -1,0 +1,42 @@
+run:
+  timeout: 5m
+  go: '1.22'
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosimple
+    - gofmt
+    - goimports
+    - misspell
+
+linters-settings:
+  errcheck:
+    check-blank: false
+    exclude-functions:
+      - os.Remove
+      - os.MkdirAll
+      - (os.File).Close
+      - (os.File).Sync
+      - (*os/exec.Cmd).Run
+
+  gofmt:
+    simplify: true
+
+  misspell:
+    locale: US
+
+issues:
+  exclude-rules:
+    # Allow unchecked errors in cleanup code
+    - path: _test\.go
+      linters:
+        - errcheck
+    # Defer statements with unchecked errors are common
+    - source: "defer"
+      linters:
+        - errcheck
