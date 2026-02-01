@@ -146,6 +146,16 @@ Edit permissions in the TUI or modify the config file at `~/.config/bottle-launc
 - **WARNING:** Losing a YubiKey means permanent data loss for YubiKey-protected bottles
 - Config files contain FIDO2 credential IDs (not secrets) - back them up!
 
+## Project Structure
+
+```
+bottle-launch/
+├── src/           # Go source code
+├── Makefile       # Build commands
+├── logo.png
+└── README.md
+```
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
