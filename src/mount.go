@@ -90,7 +90,37 @@ func udisksMountBottle(bottle, password string) (*MountInfo, error) {
 		out, err := exec.Command("udisksctl", "mount", "-b", info.CleartextDevice,
 			"--options", "nodev,nosuid,noexec").CombinedOutput()
 		if err != nil {
-			return nil, &mountError{op: "mount", msg: string(out)}
+			outStr := string(out)
+			if strings.Contains(outStr, "Error looking up object for device") && info.LoopDevice != "" {
+				// Stale dm device; relock + unlock to refresh udisks state, then retry mount.
+				_, _ = exec.Command("udisksctl", "lock", "-b", info.LoopDevice).CombinedOutput()
+				var unlockCmd *exec.Cmd
+				if password != "" {
+					unlockCmd = exec.Command("udisksctl", "unlock", "-b", info.LoopDevice, "--key-file", "/dev/stdin")
+					unlockCmd.Stdin = strings.NewReader(password)
+				} else {
+					unlockCmd = exec.Command("udisksctl", "unlock", "-b", info.LoopDevice)
+				}
+				out2, err2 := unlockCmd.CombinedOutput()
+				if err2 != nil {
+					return nil, &mountError{op: "unlock", msg: string(out2)}
+				}
+				re := regexp.MustCompile(`/dev/dm-\d+`)
+				match := re.FindString(string(out2))
+				if match == "" {
+					return nil, &mountError{op: "unlock", msg: "could not parse cleartext device"}
+				}
+				info.CleartextDevice = match
+
+				out3, err3 := exec.Command("udisksctl", "mount", "-b", info.CleartextDevice,
+					"--options", "nodev,nosuid,noexec").CombinedOutput()
+				if err3 != nil {
+					return nil, &mountError{op: "mount", msg: string(out3)}
+				}
+				out = out3
+			} else {
+				return nil, &mountError{op: "mount", msg: outStr}
+			}
 		}
 
 		// Parse: Mounted /dev/dm-0 at /run/media/user/...
@@ -244,7 +274,36 @@ func udisksMountBottleFIDO2(bottle string, fido2Secret []byte) (*MountInfo, erro
 		out, err := exec.Command("udisksctl", "mount", "-b", info.CleartextDevice,
 			"--options", "nodev,nosuid,noexec").CombinedOutput()
 		if err != nil {
-			return nil, &mountError{op: "mount", msg: string(out)}
+			outStr := string(out)
+			if strings.Contains(outStr, "Error looking up object for device") && info.LoopDevice != "" {
+				// Stale dm device; relock + unlock to refresh udisks state, then retry mount.
+				_, _ = exec.Command("udisksctl", "lock", "-b", info.LoopDevice).CombinedOutput()
+				keyPath, cleanup, errKey := writeSecretToTempFile(fido2Secret, "fido2-unlock-")
+				if errKey != nil {
+					return nil, errKey
+				}
+				defer cleanup()
+				unlockCmd := exec.Command("udisksctl", "unlock", "-b", info.LoopDevice, "--key-file", keyPath)
+				out2, err2 := unlockCmd.CombinedOutput()
+				if err2 != nil {
+					return nil, &mountError{op: "unlock", msg: string(out2)}
+				}
+				re := regexp.MustCompile(`/dev/dm-\d+`)
+				match := re.FindString(string(out2))
+				if match == "" {
+					return nil, &mountError{op: "unlock", msg: "could not parse cleartext device"}
+				}
+				info.CleartextDevice = match
+
+				out3, err3 := exec.Command("udisksctl", "mount", "-b", info.CleartextDevice,
+					"--options", "nodev,nosuid,noexec").CombinedOutput()
+				if err3 != nil {
+					return nil, &mountError{op: "mount", msg: string(out3)}
+				}
+				out = out3
+			} else {
+				return nil, &mountError{op: "mount", msg: outStr}
+			}
 		}
 
 		// Parse: Mounted /dev/dm-0 at /run/media/user/...

@@ -137,9 +137,7 @@ func (m model) renderAppSelect() string {
 		sb.WriteString(m.appList.View())
 	}
 
-	sb.WriteString("\n\n")
-	sb.WriteString(dimStyle.Render("Type to filter, Enter to select, Esc to go back"))
-	sb.WriteString("\n\n")
+	sb.WriteString("\n")
 	sb.WriteString(m.renderFooter())
 
 	return sb.String()

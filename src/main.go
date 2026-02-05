@@ -4,17 +4,21 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// Global mount state for signal handler cleanup
+// Global state for signal handler cleanup
 var (
 	currentMountInfo *MountInfo
+	currentRunningCmd *exec.Cmd
 	mountMutex       sync.Mutex
+	cleanupOnce      sync.Once
 )
 
 // SetCurrentMountInfo updates the global mount info (for signal handler cleanup)
@@ -24,19 +28,82 @@ func SetCurrentMountInfo(info *MountInfo) {
 	mountMutex.Unlock()
 }
 
-// setupSignalHandler sets up SIGTERM/SIGINT handling to unmount on abnormal exit
+// SetCurrentRunningCmd updates the global running command (for signal handler cleanup)
+func SetCurrentRunningCmd(cmd *exec.Cmd) {
+	mountMutex.Lock()
+	currentRunningCmd = cmd
+	mountMutex.Unlock()
+}
+
+// setupSignalHandler sets up signal handling to unmount on abnormal exit.
+// Handles SIGTERM, SIGHUP, and SIGQUIT. SIGINT is handled by Bubbletea in TUI mode.
 func setupSignalHandler() {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(c, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	go func() {
-		<-c
-		mountMutex.Lock()
-		if currentMountInfo != nil {
-			udisksUnmountBottle(currentMountInfo)
+		sig := <-c
+		performCleanup()
+		// Use appropriate exit code based on signal
+		switch sig {
+		case syscall.SIGTERM:
+			os.Exit(128 + 15) // SIGTERM = 15
+		case syscall.SIGHUP:
+			os.Exit(128 + 1) // SIGHUP = 1
+		case syscall.SIGQUIT:
+			os.Exit(128 + 3) // SIGQUIT = 3
+		default:
+			os.Exit(ExitSIGINT)
 		}
-		mountMutex.Unlock()
-		os.Exit(ExitSIGINT)
 	}()
+}
+
+// setupSignalHandlerCLI sets up signal handling for CLI mode.
+// Also handles SIGINT since there's no TUI to intercept it.
+func setupSignalHandlerCLI() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	go func() {
+		sig := <-c
+		performCleanup()
+		// Use appropriate exit code based on signal
+		switch sig {
+		case syscall.SIGINT:
+			os.Exit(ExitSIGINT)
+		case syscall.SIGTERM:
+			os.Exit(128 + 15) // SIGTERM = 15
+		case syscall.SIGHUP:
+			os.Exit(128 + 1) // SIGHUP = 1
+		case syscall.SIGQUIT:
+			os.Exit(128 + 3) // SIGQUIT = 3
+		default:
+			os.Exit(ExitSIGINT)
+		}
+	}()
+}
+
+// performCleanup stops any running process and unmounts the bottle.
+// Safe to call multiple times due to sync.Once.
+func performCleanup() {
+	cleanupOnce.Do(func() {
+		mountMutex.Lock()
+		defer mountMutex.Unlock()
+
+		// Stop running Flatpak process first
+		if currentRunningCmd != nil && currentRunningCmd.Process != nil {
+			_ = currentRunningCmd.Process.Signal(syscall.SIGTERM)
+			// Give it a moment to terminate gracefully
+			time.Sleep(200 * time.Millisecond)
+			// Force kill if still running
+			_ = currentRunningCmd.Process.Kill()
+			currentRunningCmd = nil
+		}
+
+		// Unmount the bottle
+		if currentMountInfo != nil {
+			_ = udisksUnmountBottle(currentMountInfo)
+			currentMountInfo = nil
+		}
+	})
 }
 
 func main() {
@@ -89,8 +156,18 @@ func main() {
 
 	// TUI mode
 	setupSignalHandler()
+
+	// Ensure cleanup happens on panic or unexpected exit
+	defer func() {
+		if r := recover(); r != nil {
+			performCleanup()
+			panic(r) // Re-panic after cleanup
+		}
+	}()
+
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
+		performCleanup()
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -135,12 +212,21 @@ func cmdRun(bottle, appID string, extraArgs []string) error {
 		return err
 	}
 	SetCurrentMountInfo(mountInfo)
-	setupSignalHandler()
-	defer SetCurrentMountInfo(nil)
-	defer udisksUnmountBottle(mountInfo)
+	setupSignalHandlerCLI()
+	defer func() {
+		SetCurrentRunningCmd(nil)
+		SetCurrentMountInfo(nil)
+		udisksUnmountBottle(mountInfo)
+	}()
 
-	// Run the app
-	return runFlatpakApp(appID, mountInfo.MountPoint, perms, extraArgs)
+	// Build and run the app, tracking the command for signal cleanup
+	cmd := buildFlatpakCommand(appID, mountInfo.MountPoint, perms, extraArgs)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	SetCurrentRunningCmd(cmd)
+	return cmd.Run()
 }
 
 // cmdList lists mounted bottles

@@ -203,15 +203,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case appsLoadedMsg:
 		m.apps = msg.apps
 		items := make([]list.Item, len(msg.apps))
+		lastAppIndex := 0
 		for i, app := range msg.apps {
 			items[i] = appItem{app: app}
+			// Find last used app
+			if m.permissions.LastApp != "" && app.ID == m.permissions.LastApp {
+				lastAppIndex = i
+			}
 		}
 		al := list.New(items, appItemDelegate{}, m.width-4, m.height-8)
 		al.Title = "Select Application"
-		al.SetShowStatusBar(false)
+		al.SetShowStatusBar(true) // Show filter status
 		al.SetFilteringEnabled(true)
 		al.Styles.Title = titleStyle
-		al.SetShowHelp(false)
+		al.SetShowHelp(true) // Show keybinding help for filtering
+		// Select last used app
+		al.Select(lastAppIndex)
 		m.appList = al
 		m.state = viewAppSelect
 		m.loading = false
@@ -224,6 +231,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = viewRunning
 		cmd, running := startFlatpakCmd(m.selectedApp.ID, msg.info.MountPoint, m.permissions, nil)
 		m.runningCmd = running
+		SetCurrentRunningCmd(running) // Update global for signal handler
 		return m, cmd
 
 	case mountFailedMsg:
@@ -242,6 +250,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case appFinishedMsg:
 		// App finished running, unmount and return to bottle list
 		m.runningCmd = nil
+		SetCurrentRunningCmd(nil) // Clear global for signal handler
 		if m.mountInfo != nil {
 			if err := udisksUnmountBottle(m.mountInfo); err != nil {
 				m.errMsg = "Unmount failed: " + err.Error()
@@ -318,6 +327,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = viewRunning
 		cmd, running := startFlatpakCmd(m.selectedApp.ID, msg.info.MountPoint, m.permissions, nil)
 		m.runningCmd = running
+		SetCurrentRunningCmd(running) // Update global for signal handler
 		return m, cmd
 
 	case fido2UnlockFailedMsg:
@@ -488,14 +498,21 @@ func (m model) updatePermissions(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateAppSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Let the list process the message first (for filtering, navigation, etc.)
+	var cmd tea.Cmd
+	m.appList, cmd = m.appList.Update(msg)
+
+	// Then handle our specific actions
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "esc":
+		// Only handle esc when NOT filtering
+		if msg.String() == "esc" && m.appList.FilterState() == list.Unfiltered {
 			m.cursor = 0
 			m.state = viewBottleActions
 			return m, nil
-		case "enter":
+		}
+		// Handle enter to select (list might also process it, but we need to act on selection)
+		if msg.String() == "enter" && m.appList.FilterState() != list.Filtering {
 			if i, ok := m.appList.SelectedItem().(appItem); ok {
 				m.selectedApp = i.app
 				m.permissions.LastApp = i.app.ID
@@ -506,8 +523,6 @@ func (m model) updateAppSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	var cmd tea.Cmd
-	m.appList, cmd = m.appList.Update(msg)
 	return m, cmd
 }
 
@@ -536,6 +551,7 @@ func (m model) updateLaunchConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.state = viewRunning
 						cmd, running := startFlatpakCmd(m.selectedApp.ID, mount, m.permissions, nil)
 						m.runningCmd = running
+						SetCurrentRunningCmd(running) // Update global for signal handler
 						return m, cmd
 					}
 				}
@@ -872,6 +888,8 @@ func (m *model) stopAndUnmount() error {
 	if m.runningCmd != nil && m.runningCmd.Process != nil {
 		_ = m.runningCmd.Process.Signal(syscall.SIGTERM)
 		time.Sleep(200 * time.Millisecond)
+		// Force kill if still running
+		_ = m.runningCmd.Process.Kill()
 	}
 
 	if m.mountInfo != nil {
@@ -883,6 +901,7 @@ func (m *model) stopAndUnmount() error {
 	}
 
 	m.runningCmd = nil
+	SetCurrentRunningCmd(nil)
 	return nil
 }
 
