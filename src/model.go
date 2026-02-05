@@ -2,6 +2,10 @@
 package main
 
 import (
+	"os/exec"
+	"syscall"
+	"time"
+
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -63,7 +67,8 @@ type model struct {
 	errMsg string
 
 	// Mount info for cleanup
-	mountInfo *MountInfo
+	mountInfo  *MountInfo
+	runningCmd *exec.Cmd
 
 	// Window size
 	width  int
@@ -150,20 +155,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c":
 			// Unmount before quitting
-			if m.mountInfo != nil {
-				udisksUnmountBottle(m.mountInfo)
-				m.mountInfo = nil
-				SetCurrentMountInfo(nil)
+			if err := m.stopAndUnmount(); err != nil {
+				m.errMsg = "Unmount failed: " + err.Error()
+				m.state = viewError
+				return m, nil
 			}
 			return m, tea.Quit
 		case "q":
 			// 'q' quits except during text input or forms
 			if m.state != viewPasswordInput && m.state != viewCreateBottle {
 				// Unmount before quitting
-				if m.mountInfo != nil {
-					udisksUnmountBottle(m.mountInfo)
-					m.mountInfo = nil
-					SetCurrentMountInfo(nil)
+				if err := m.stopAndUnmount(); err != nil {
+					m.errMsg = "Unmount failed: " + err.Error()
+					m.state = viewError
+					return m, nil
 				}
 				return m, tea.Quit
 			}
@@ -217,7 +222,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		SetCurrentMountInfo(msg.info) // Update global for signal handler
 		m.loading = false
 		m.state = viewRunning
-		return m, runFlatpakCmd(m.selectedApp.ID, msg.info.MountPoint, m.permissions, nil)
+		cmd, running := startFlatpakCmd(m.selectedApp.ID, msg.info.MountPoint, m.permissions, nil)
+		m.runningCmd = running
+		return m, cmd
 
 	case mountFailedMsg:
 		m.loading = false
@@ -234,6 +241,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case appFinishedMsg:
 		// App finished running, unmount and return to bottle list
+		m.runningCmd = nil
 		if m.mountInfo != nil {
 			if err := udisksUnmountBottle(m.mountInfo); err != nil {
 				m.errMsg = "Unmount failed: " + err.Error()
@@ -308,7 +316,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.fido2Secret = nil // Clear sensitive data
 		m.state = viewRunning
-		return m, runFlatpakCmd(m.selectedApp.ID, msg.info.MountPoint, m.permissions, nil)
+		cmd, running := startFlatpakCmd(m.selectedApp.ID, msg.info.MountPoint, m.permissions, nil)
+		m.runningCmd = running
+		return m, cmd
 
 	case fido2UnlockFailedMsg:
 		m.loading = false
@@ -524,7 +534,9 @@ func (m model) updateLaunchConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						SetCurrentMountInfo(m.mountInfo) // Update global for signal handler
 						m.state = viewRunning
-						return m, runFlatpakCmd(m.selectedApp.ID, mount, m.permissions, nil)
+						cmd, running := startFlatpakCmd(m.selectedApp.ID, mount, m.permissions, nil)
+						m.runningCmd = running
+						return m, cmd
 					}
 				}
 			}
@@ -854,6 +866,24 @@ func (m model) updateFIDO2Unlock(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *model) stopAndUnmount() error {
+	if m.runningCmd != nil && m.runningCmd.Process != nil {
+		_ = m.runningCmd.Process.Signal(syscall.SIGTERM)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if m.mountInfo != nil {
+		if err := udisksUnmountBottle(m.mountInfo); err != nil {
+			return err
+		}
+		m.mountInfo = nil
+		SetCurrentMountInfo(nil)
+	}
+
+	m.runningCmd = nil
+	return nil
 }
 
 func (m model) View() string {

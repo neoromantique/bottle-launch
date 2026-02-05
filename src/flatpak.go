@@ -103,8 +103,8 @@ func buildFlatpakArgs(appID, mountPoint string, perms *Permissions, extraArgs []
 	return args
 }
 
-// runFlatpakApp runs a Flatpak app (blocking)
-func runFlatpakApp(appID, mountPoint string, perms *Permissions, extraArgs []string) error {
+// buildFlatpakCommand creates an exec.Cmd for running a Flatpak app.
+func buildFlatpakCommand(appID, mountPoint string, perms *Permissions, extraArgs []string) *exec.Cmd {
 	// Create standard directories
 	dirs := []string{
 		"Downloads",
@@ -117,10 +117,14 @@ func runFlatpakApp(appID, mountPoint string, perms *Permissions, extraArgs []str
 	}
 
 	args := buildFlatpakArgs(appID, mountPoint, perms, extraArgs)
-	cmd := exec.Command("flatpak", args...)
+	return exec.Command("flatpak", args...)
+}
+
+// runFlatpakApp runs a Flatpak app (blocking)
+func runFlatpakApp(appID, mountPoint string, perms *Permissions, extraArgs []string) error {
+	cmd := buildFlatpakCommand(appID, mountPoint, perms, extraArgs)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
 	return cmd.Run()
 }

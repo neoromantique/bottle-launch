@@ -2,7 +2,6 @@
 package main
 
 import (
-	"os"
 	"os/exec"
 	"path/filepath"
 
@@ -104,24 +103,11 @@ func mountBottleCmd(bottle, password string) tea.Cmd {
 	}
 }
 
-func runFlatpakCmd(appID, mountPoint string, perms *Permissions, extraArgs []string) tea.Cmd {
-	// Create standard directories
-	dirs := []string{
-		"Downloads",
-		".config",
-		".local/share",
-		".cache",
-	}
-	for _, dir := range dirs {
-		os.MkdirAll(filepath.Join(mountPoint, dir), 0755)
-	}
-
-	args := buildFlatpakArgs(appID, mountPoint, perms, extraArgs)
-	c := exec.Command("flatpak", args...)
-
+func startFlatpakCmd(appID, mountPoint string, perms *Permissions, extraArgs []string) (tea.Cmd, *exec.Cmd) {
+	c := buildFlatpakCommand(appID, mountPoint, perms, extraArgs)
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		return appFinishedMsg{err: err}
-	})
+	}), c
 }
 
 func createBottleCmd(name, size, password string) tea.Cmd {

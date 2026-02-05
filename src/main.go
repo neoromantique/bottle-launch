@@ -134,6 +134,9 @@ func cmdRun(bottle, appID string, extraArgs []string) error {
 	if err != nil {
 		return err
 	}
+	SetCurrentMountInfo(mountInfo)
+	setupSignalHandler()
+	defer SetCurrentMountInfo(nil)
 	defer udisksUnmountBottle(mountInfo)
 
 	// Run the app
